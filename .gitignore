@@ -31,6 +31,8 @@ env/
 # jupyter
 .ipynb_checkpoints/
 *.ipynb
+# allow Colab training notebooks
+!**/Model4_MLPMixer_Colab.ipynb
 
 # OS files
 .DS_Store

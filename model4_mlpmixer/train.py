@@ -1,5 +1,5 @@
 # train.py
-# run data_exploration.py first to generate filtered_metadata.csv and class_map.json
+# prerequisite: run  python model1_cnn/data_exploration.py  from the project root first
 
 import sys
 import time
@@ -13,19 +13,17 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent))
 import config as cfg
 from dataset import build_datasets
-from model import PillCNN, count_parameters
+from model import PillMixer, count_parameters
 
 
 def get_device():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print("using GPU:", torch.cuda.get_device_name(0))
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("using Apple MPS")
     else:
+        # MPS skipped intentionally: LayerNorm produces NaN on MPS (known PyTorch bug)
         device = torch.device("cpu")
-        print("using CPU (this will be slow)")
+        print("using CPU")
     return device
 
 
@@ -46,7 +44,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         optimizer.zero_grad()
         logits = model(images)
         loss   = criterion(logits, labels)
+        if torch.isnan(loss):
+            continue
         loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item() * images.size(0)
@@ -80,7 +81,6 @@ def train(model, train_loader, val_loader, device, class_weights):
 
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE)
-    # halve LR if val accuracy stops improving for 3 epochs
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.5, patience=3
     )
@@ -112,10 +112,15 @@ def train(model, train_loader, val_loader, device, class_weights):
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save({
-                "epoch": epoch,
+                "epoch":            epoch,
                 "model_state_dict": model.state_dict(),
-                "val_acc": val_acc,
-                "num_classes": cfg.NUM_CLASSES,
+                "val_acc":          val_acc,
+                "num_classes":      cfg.NUM_CLASSES,
+                "patch_size":       cfg.PATCH_SIZE,
+                "hidden_dim":       cfg.HIDDEN_DIM,
+                "num_layers":       cfg.NUM_MIXER_LAYERS,
+                "tokens_mlp_dim":   cfg.TOKENS_MLP_DIM,
+                "channels_mlp_dim": cfg.CHANNELS_MLP_DIM,
             }, cfg.BEST_MODEL_PATH)
 
     print("\nbest val acc: %.4f  saved to %s" % (best_val_acc, cfg.BEST_MODEL_PATH))
@@ -130,14 +135,14 @@ def save_learning_curves(history):
     ax1.plot(epochs, history["val_loss"],   label="val")
     ax1.set_xlabel("epoch")
     ax1.set_ylabel("loss")
-    ax1.set_title("loss")
+    ax1.set_title("loss — PillSight MLP-Mixer")
     ax1.legend()
 
     ax2.plot(epochs, history["train_acc"], label="train")
     ax2.plot(epochs, history["val_acc"],   label="val")
     ax2.set_xlabel("epoch")
     ax2.set_ylabel("accuracy")
-    ax2.set_title("accuracy")
+    ax2.set_title("accuracy — PillSight MLP-Mixer")
     ax2.legend()
 
     plt.tight_layout()
@@ -151,13 +156,25 @@ def save_learning_curves(history):
 def main():
     device = get_device()
 
-    train_ds, val_ds, test_ds = build_datasets()
-    train_loader, val_loader  = build_loaders(train_ds, val_ds)
+    train_ds, val_ds, _ = build_datasets()
+    train_loader, val_loader = build_loaders(train_ds, val_ds)
 
     class_weights = train_ds.get_class_weights()
     print("class weights:", [round(w, 4) for w in class_weights.tolist()])
 
-    model = PillCNN(num_classes=cfg.NUM_CLASSES, dropout_rate=cfg.DROPOUT_RATE).to(device)
+    n_patches = (cfg.IMAGE_SIZE // cfg.PATCH_SIZE) ** 2
+    print("patch size: %d×%d  |  patches per image: %d" % (cfg.PATCH_SIZE, cfg.PATCH_SIZE, n_patches))
+
+    model = PillMixer(
+        num_classes=cfg.NUM_CLASSES,
+        image_size=cfg.IMAGE_SIZE,
+        patch_size=cfg.PATCH_SIZE,
+        hidden_dim=cfg.HIDDEN_DIM,
+        num_layers=cfg.NUM_MIXER_LAYERS,
+        tokens_mlp_dim=cfg.TOKENS_MLP_DIM,
+        channels_mlp_dim=cfg.CHANNELS_MLP_DIM,
+        dropout_rate=cfg.DROPOUT_RATE,
+    ).to(device)
     print("parameters:", count_parameters(model))
 
     history = train(model, train_loader, val_loader, device, class_weights)
